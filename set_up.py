@@ -14,7 +14,6 @@ VOLUMES = [os.environ.get("VOLUME_BRONZE"), os.environ.get("VOLUME_SILVER"), os.
 def execute_sql(sql_query):
     """
     Executa comandos SQL via SDK.
-    Nota: Requer um SQL Warehouse ativo.
     """
     # Na Community Edition, tentamos pegar o primeiro Warehouse disponível
     warehouses = list(w.warehouses.list())

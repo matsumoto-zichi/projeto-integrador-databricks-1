@@ -1,63 +1,83 @@
 import os
-from dotenv import load_dotenv
 import pandas as pd
+from dotenv import load_dotenv
+from pyspark.sql import Window
+from pyspark.sql.functions import col, row_number
 from sentence_transformers import SentenceTransformer
-from pyspark.sql.functions import pandas_udf, col
-from pyspark.sql.types import ArrayType, StringType, FloatType
-
 
 load_dotenv()
 
-# Nome da tabela final na Unity Catalog
-GOLD_VOLUME_PARQUET_PATH = os.environ.get("GOLD_VOLUME_PARQUET_PATH")
+# envs
+CATALOG_NAME = os.environ.get("CATALOG_NAME")
+SCHEMA_NAME = os.environ.get("SCHEMA_NAME")
 TARGET_TABLE_RAG_NAME = os.environ.get("TARGET_TABLE_RAG_NAME")
 EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL_NAME")
+GOLD_TABLE_CHUNKS = os.environ.get("GOLD_TABLE_CHUNKS")
+GOLD_TABLE_EMBEDDINGS = os.environ.get("GOLD_TABLE_EMBEDDINGS")
+# Caminhos
+RAG_TABLE_PATH = f"{CATALOG_NAME}.{SCHEMA_NAME}.{TARGET_TABLE_RAG_NAME}"
+CHUNK_TABLE_PATH = f"{CATALOG_NAME}.{SCHEMA_NAME}.{GOLD_TABLE_CHUNKS}"
+EMBEDDING_TABLE_PATH = f"{CATALOG_NAME}.{SCHEMA_NAME}.{GOLD_TABLE_EMBEDDINGS}"
 
-@pandas_udf(ArrayType(FloatType()))
-def get_embeddings(texts: pd.Series) -> pd.Series:
 
-    # Configure writable cache directories for HuggingFace/Transformers on workers
-    os.environ['TRANSFORMERS_CACHE'] = '/tmp/transformers_cache'
-    os.environ['HF_HOME'] = '/tmp/hf_home'
-    os.environ['SENTENCE_TRANSFORMERS_HOME'] = '/tmp/sentence_transformers'
+def main():
 
+    # Load model once in the driver
     model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-    embeddings = model.encode(texts.tolist(), show_progress_bar=False)
-    return pd.Series(embeddings.tolist())
+
+    df_gold_chunks = spark.table(CHUNK_TABLE_PATH)
+
+    print(f"df_gold_chunks: ({df_gold_chunks.count()}, {len(df_gold_chunks.columns)})")
+
+    # Add row numbers for batch processing
+    window_spec = Window.orderBy("cord_uid")
+    df_with_row_num = df_gold_chunks.withColumn("row_num", row_number().over(window_spec))
+
+    # Process in batches to avoid OOM
+    # The embeddings are being generated using `all-MiniLM-L6-v2` which produces 384-dimensional vectors. For 1000 rows, that's:
+    # - 1000 rows × 384 floats × 4 bytes = ~1.5 MB just for the embeddings
+    # - Plus the original text and other columns
+    batch_size = 100
+    total_rows = df_gold_chunks.count()
+
+    # Initialize write mode
+    write_mode = "overwrite" # First overwrite existing index tables
+
+    for batch_start in range(0, total_rows, batch_size):
+        batch_end = batch_start + batch_size
+        print(f"Processing batch: rows {batch_start} to {batch_end}")
+        
+        # Filter this batch and collect to driver
+        batch_df = (df_with_row_num
+                    .filter((col("row_num") >= batch_start) & (col("row_num") < batch_end))
+                    .drop("row_num")
+                    .toPandas())
+        
+        if len(batch_df) == 0:
+            print("Empty batch, skipping...")
+            continue
+        
+        # Generate embeddings in the driver
+        texts = batch_df['chunk_text'].tolist()
+        embeddings = model.encode(texts, show_progress_bar=True)
+        
+        # Add embeddings to the pandas DataFrame
+        batch_df['chunk_text_vector'] = embeddings.tolist()
+        
+        # Convert back to Spark DataFrame
+        spark_batch_df = spark.createDataFrame(batch_df)
+        
+        # Write this batch to the table
+        (spark_batch_df.write
+        .format("delta")
+        .mode(write_mode)
+        .option("overwriteSchema", "true")
+        .option("delta.enableChangeDataFeed", "true")
+        .saveAsTable(EMBEDDING_TABLE_PATH))
+        
+        # After first batch, switch to append mode
+        write_mode = "append"
 
 if __name__ == "__main__":
-    # 1. Carregar dados do Parquet (Potencialmente novos)
-    df_new_gold = spark.read.parquet(GOLD_VOLUME_PARQUET_PATH)
-
-    # 2. Verificar o que já existe na UC para evitar re-trabalho
-    if spark.catalog.tableExists(TARGET_TABLE_RAG_NAME):
-        df_existing = spark.table(TARGET_TABLE_RAG_NAME).select("sha_id", "chunk_text").distinct()
-        
-        # Identificar apenas o que é NOVO (Left Anti Join)
-        # Comparamos SHA e o texto do chunk para garantir que mudanças no texto disparem novo embedding
-        df_to_process = df_new_gold.join(df_existing, ["sha_id", "chunk_text"], "left_anti")
-    else:
-        df_to_process = df_new_gold
-
-    # 3. Se houver novos dados, calcular embeddings
-    if df_to_process.count() > 0:
-        print(f"Processando {df_to_process.count()} novos chunks...")
-        
-        # Repartition to smaller chunks to avoid OOM errors
-        df_to_process = df_to_process.repartition(20)
-        
-
-        df_final = df_to_process.withColumn("embedding", get_embeddings(col("chunk_text")))
-
-        # 4. Salvar/Append na Tabela UC com CDF habilitado
-        (df_final.write
-        .format("delta")
-        .mode("append") # Sempre append para manter o histórico
-        .option("mergeSchema", "true")
-        .option("delta.enableChangeDataFeed", "true")
-        .option("delta.columnMapping.mode", "name")
-        .saveAsTable(TARGET_TABLE_RAG_NAME))
-        
-        print("Novos embeddings integrados à tabela UC.")
-    else:
-        print("Nenhum dado novo detectado. Tabela já está sincronizada.")
+    main()
+    print("Embeddings gerados e tabela Gold atualizada!")

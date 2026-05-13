@@ -1,6 +1,11 @@
 langchain-text-splitters
 langchain
 langchain-core
+langchain-experimental
 databricks-vectorsearch
 sentence-transformers
 torch
+kagglehub
+databricks-sdk
+pandas
+tqdm
