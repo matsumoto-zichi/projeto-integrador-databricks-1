@@ -8,6 +8,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from databricks.sdk import WorkspaceClient
 
+
 load_dotenv()
 
 # Configurações do Databricks via .env

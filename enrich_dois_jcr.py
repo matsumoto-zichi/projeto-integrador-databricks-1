@@ -4,6 +4,7 @@ import polars as pl
 from dotenv import load_dotenv
 from databricks.sdk import WorkspaceClient
 
+
 load_dotenv()
 
 # Credenciais e Configurações

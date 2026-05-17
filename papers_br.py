@@ -18,6 +18,7 @@ BRONZE_VOLUME_PATH = f"/Volumes/{CATALOG_NAME}/{SCHEMA_NAME}/{VOLUME_BRONZE}/"
 OUTPUT_CSV_PATH = f"/Volumes/{CATALOG_NAME}/{SCHEMA_NAME}/{VOLUME_BRONZE}/{OUTPUT_ARTIGOS_BR}"
 
 
+
 def identificar_artigos_br():
     shas_brasileiros = []
     
